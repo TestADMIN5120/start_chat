@@ -34,11 +34,21 @@ Settings (optional environment variables): `PORT` (default 3000) and `DB_FILE` (
 - Notices that each member confirms, with a count of who has and hasn't
 - Daily summary per group: done today and still pending
 - Switch between chat mode and advanced mode at any time
+- Edit or delete your own messages (deleted messages show as "Message deleted" for everyone)
+- 1:1 audio/video calls: tap the phone icon next to a member in a group's People panel. Ringing, accept/decline, mute, camera on/off, hang up.
+- Installable as an app on Android (Chrome "Install app") and iOS ("Add to Home Screen" in Safari)
+
+## Calling notes
+
+- Calls are 1:1 only, signaled over the same WebSocket connection used for live chat, with no server in the media path — audio/video goes directly between the two phones (peer-to-peer WebRTC).
+- Uses a public STUN server only, no TURN server. This works on most home/office Wi-Fi, but calls between two people on strict/corporate NAT or some carrier-grade mobile networks may fail to connect. Adding a TURN server would fix that at the cost of running (or paying for) one.
+- No call history or missed-call list — calls are not stored anywhere.
+- Camera and microphone access needs a secure context: it works on the deployed `https://` site and on `http://localhost`, but **not** on `http://<lan-ip>:3000` opened from a phone. Test calling either on the deployed site or with both browser tabs on `localhost`.
 
 ## Not built yet
 
 - **Phone number verification (SMS code).** Right now anyone who knows a phone number can sign in as that person. This must be added before real users are invited.
-- Voice and video calls
+- Group calls (more than two people)
 - Photos, files and voice notes
 - Notifications when the app is closed
 - One-to-one chats as their own type (for now, make a group of two)

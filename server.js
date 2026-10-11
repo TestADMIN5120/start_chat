@@ -43,6 +43,14 @@ const get = (sql, ...p) => db.prepare(sql).get(...p);
 const run = (sql, ...p) => db.prepare(sql).run(...p);
 const insert = (sql, ...p) => Number(run(sql, ...p).lastInsertRowid);
 
+function ensureColumn(table, column, ddl) {
+  if (!all(`PRAGMA table_info(${table})`).some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+ensureColumn('messages', 'edited_at', 'edited_at INTEGER');
+ensureColumn('messages', 'deleted_at', 'deleted_at INTEGER');
+
 const cleanPhone = (v) => String(v || '').replace(/\D/g, '');
 const cleanText = (v, max) => String(v || '').trim().slice(0, max);
 const publicUser = (u) => ({ id: u.id, name: u.name, phone: u.phone, mode: u.mode });
@@ -63,6 +71,17 @@ function notifyGroup(groupId) {
     }
   }
 }
+
+function sendTo(userId, payload) {
+  const set = sockets.get(userId);
+  if (!set || !set.size) return false;
+  const msg = JSON.stringify(payload);
+  for (const ws of set) if (ws.readyState === 1) ws.send(msg);
+  return true;
+}
+
+// 1:1 call signaling, relayed over the same socket, only between people who share a group.
+const CALL_TYPES = new Set(['call-offer', 'call-answer', 'call-ice-candidate', 'call-decline', 'call-hangup']);
 
 function addMessage(groupId, userId, kind, text, refId) {
   insert('INSERT INTO messages (group_id, user_id, kind, text, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -132,10 +151,10 @@ app.get('/api/groups', route((req) => {
     FROM chat_groups g JOIN members m ON m.group_id = g.id
     WHERE m.user_id = ?`, req.user.id, req.user.id);
   for (const g of groups) {
-    const last = get(`SELECT m.text, m.kind, m.created_at, u.name FROM messages m
+    const last = get(`SELECT m.text, m.kind, m.created_at, m.deleted_at, u.name FROM messages m
                       LEFT JOIN users u ON u.id = m.user_id
                       WHERE m.group_id = ? ORDER BY m.id DESC LIMIT 1`, g.id);
-    g.last = last || null;
+    g.last = last ? { ...last, text: last.deleted_at ? 'Message deleted' : last.text } : null;
   }
   groups.sort((a, b) => (b.last ? b.last.created_at : 0) - (a.last ? a.last.created_at : 0));
   return { groups };
@@ -196,6 +215,31 @@ app.post('/api/groups/:id/messages', route((req) => {
   if (!text) fail(400, 'Type a message first.');
   addMessage(group.id, req.user.id, 'text', text);
   notifyGroup(group.id);
+}));
+
+function ownedTextMessage(req) {
+  const id = Number(req.params.id);
+  const msg = get('SELECT * FROM messages WHERE id = ?', id);
+  if (!msg || msg.kind !== 'text' || msg.deleted_at) fail(404, 'Message not found.');
+  if (msg.user_id !== req.user.id) fail(403, 'You can only change your own messages.');
+  if (!get('SELECT 1 AS ok FROM members WHERE group_id = ? AND user_id = ?', msg.group_id, req.user.id)) {
+    fail(404, 'Message not found.');
+  }
+  return msg;
+}
+
+app.put('/api/messages/:id', route((req) => {
+  const msg = ownedTextMessage(req);
+  const text = cleanText(req.body.text, 4000);
+  if (!text) fail(400, 'Type a message first.');
+  run('UPDATE messages SET text = ?, edited_at = ? WHERE id = ?', text, Date.now(), msg.id);
+  notifyGroup(msg.group_id);
+}));
+
+app.delete('/api/messages/:id', route((req) => {
+  const msg = ownedTextMessage(req);
+  run('UPDATE messages SET deleted_at = ? WHERE id = ?', Date.now(), msg.id);
+  notifyGroup(msg.group_id);
 }));
 
 app.post('/api/groups/:id/tasks', route((req) => {
@@ -275,10 +319,25 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (ws, req) => {
   const token = new URL(req.url, 'http://x').searchParams.get('token');
-  const user = token && get('SELECT id FROM users WHERE token = ?', token);
+  const user = token && get('SELECT id, name FROM users WHERE token = ?', token);
   if (!user) return ws.close();
   if (!sockets.has(user.id)) sockets.set(user.id, new Set());
   sockets.get(user.id).add(ws);
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    if (!CALL_TYPES.has(msg.type)) return;
+    const to = Number(msg.to);
+    if (!to || to === user.id) return;
+    const shareGroup = get(`SELECT 1 AS ok FROM members m1 JOIN members m2 ON m1.group_id = m2.group_id
+                            WHERE m1.user_id = ? AND m2.user_id = ?`, user.id, to);
+    if (!shareGroup) return;
+    const out = { type: msg.type, from: user.id, fromName: user.name, to };
+    if (msg.sdp) out.sdp = msg.sdp;
+    if (msg.candidate) out.candidate = msg.candidate;
+    const delivered = sendTo(to, out);
+    if (!delivered && msg.type === 'call-offer') sendTo(user.id, { type: 'call-busy', from: to, to: user.id });
+  });
   ws.on('close', () => {
     const set = sockets.get(user.id);
     if (set) { set.delete(ws); if (!set.size) sockets.delete(user.id); }
