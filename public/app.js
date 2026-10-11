@@ -20,7 +20,8 @@ const S = {
   toast: '',
   menuId: null,     // message whose edit/delete menu is open
   editingId: null,  // message currently being edited
-  call: null,       // { state: 'ringing-out'|'ringing-in'|'active', peerId, peerName, muted, cameraOff }
+  pickingMeeting: false, // showing the "choose who to invite" picker
+  call: null,       // { meetingId, groupId, state: 'ringing-out'|'ringing-in'|'active', muted, cameraOff, selfScreenSharing, roster: [{id,name,status}], inviteFrom }
 };
 
 // ---------- small helpers ----------
@@ -89,7 +90,7 @@ async function refresh() {
 }
 
 const go = act(async (view) => {
-  S.view = view; S.sel = null; S.showMembers = false;
+  S.view = view; S.sel = null; S.showMembers = false; S.pickingMeeting = false;
   if (view.name === 'group') S.group = null;
   render();
   await refresh();
@@ -105,7 +106,7 @@ function connect() {
   socket.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (msg.type === 'update') refresh().catch(() => {});
-    else if (msg.type.slice(0, 5) === 'call-') handleSignal(msg);
+    else if (msg.type.slice(0, 5) === 'call-' || msg.type.slice(0, 8) === 'meeting-') handleSignal(msg);
   };
   socket.onclose = () => { if (S.token) setTimeout(connect, 2000); };
   socket.onopen = () => { refresh().catch(() => {}); };
@@ -186,83 +187,165 @@ const postNotice = act(async () => {
 
 const ackNotice = act(async (notice) => { await api('POST', `/api/notices/${notice.id}/ack`); });
 
-// ---------- calls ----------
+// ---------- calls / group meetings (mesh, up to 4 people) ----------
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
-let pc, localStream, remoteStream, callTimer;
+const MAX_PARTICIPANTS = 4;
+let localStream, screenStream;
+const peers = new Map(); // peerId -> { pc, remoteStream }
 
 function sendSignal(type, to, extra) {
   if (socket && socket.readyState === 1) socket.send(JSON.stringify(Object.assign({ type, to }, extra)));
 }
 
-function wirePeerConnection(peerId) {
-  pc.onicecandidate = (e) => { if (e.candidate) sendSignal('call-ice-candidate', peerId, { candidate: e.candidate }); };
-  remoteStream = new MediaStream();
+function ensurePeerConnection(peerId) {
+  if (peers.has(peerId)) return peers.get(peerId).pc;
+  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+  const remoteStream = new MediaStream();
+  peers.set(peerId, { pc, remoteStream });
+  pc.onicecandidate = (e) => { if (e.candidate) sendSignal('call-ice-candidate', peerId, { candidate: e.candidate, meetingId: S.call.meetingId }); };
   pc.ontrack = (e) => { remoteStream.addTrack(e.track); renderCallOverlay(); };
   pc.onconnectionstatechange = () => {
-    if (pc && pc.connectionState === 'connected' && S.call) { S.call.state = 'active'; renderCallOverlay(); }
-    if (pc && (pc.connectionState === 'failed' || pc.connectionState === 'disconnected')) endCall();
+    if (pc.connectionState === 'connected' && S.call) { S.call.state = 'active'; renderCallOverlay(); }
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') dropPeer(peerId);
   };
+  if (localStream) localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  return pc;
 }
 
-const startCall = act(async (peerId, peerName) => {
-  if (S.call) return;
-  S.call = { state: 'ringing-out', peerId, peerName, muted: false, cameraOff: false };
-  renderCallOverlay();
-  localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  wirePeerConnection(peerId);
-  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+async function initiateTo(peerId) {
+  const pc = ensurePeerConnection(peerId);
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  sendSignal('call-offer', peerId, { sdp: offer });
+  sendSignal('call-offer', peerId, { sdp: offer, meetingId: S.call.meetingId });
+}
+
+// Lower user id always initiates, so two sides never both send an offer at once.
+function reconcileRoster(participants) {
+  for (const p of participants) {
+    if (p.id === S.me.id || peers.has(p.id)) continue;
+    if (S.me.id < p.id) initiateTo(p.id); else ensurePeerConnection(p.id);
+  }
+}
+
+function dropPeer(peerId) {
+  const p = peers.get(peerId);
+  if (p) { p.pc.close(); peers.delete(peerId); }
+  if (S.call) {
+    S.call.roster = S.call.roster.filter((r) => r.id !== peerId);
+    const othersLeft = S.call.roster.some((r) => r.id !== S.me.id);
+    if (!othersLeft) { endCall(); return; }
+  }
   renderCallOverlay();
+}
+
+function applyRoster(msg) {
+  if (!S.call || msg.meetingId !== S.call.meetingId) return;
+  const seen = new Set(msg.participants.map((p) => p.id));
+  for (const id of [...peers.keys()]) if (!seen.has(id) && id !== S.me.id) dropPeer(id);
+  S.call.roster = [
+    ...msg.participants.map((p) => ({ id: p.id, name: p.name, status: 'connected', screenSharing: peerSharing(p.id) })),
+    ...msg.invited.map((p) => ({ id: p.id, name: p.name, status: 'ringing', screenSharing: false })),
+  ];
+  reconcileRoster(msg.participants);
+  if (S.call.state === 'ringing-in') S.call.state = 'active';
+  renderCallOverlay();
+}
+function peerSharing(id) {
+  const r = S.call && S.call.roster.find((x) => x.id === id);
+  return r ? !!r.screenSharing : false;
+}
+
+async function acquireLocalMedia(wantVideo) {
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
+  if (!wantVideo) localStream.getVideoTracks().forEach((t) => { t.enabled = false; });
+}
+
+const startMeeting = act(async (groupId, inviteeIds) => {
+  if (S.call) return;
+  const expectedCount = inviteeIds.length + 1;
+  S.call = {
+    meetingId: null, groupId, state: 'ringing-out', muted: false, cameraOff: expectedCount >= 3, selfScreenSharing: false,
+    roster: [{ id: S.me.id, name: 'You', status: 'connected', screenSharing: false }],
+  };
+  renderCallOverlay();
+  await acquireLocalMedia(expectedCount < 3);
+  sendSignal('meeting-start', null, { groupId, inviteeIds });
 });
 
-function incomingCall(msg) {
-  if (S.call) { sendSignal('call-busy', msg.from, {}); return; }
-  S.call = { state: 'ringing-in', peerId: msg.from, peerName: msg.fromName, muted: false, cameraOff: false, offerSdp: msg.sdp };
+function incomingMeetingInvite(msg) {
+  if (S.call) { sendSignal('meeting-decline', msg.from, { meetingId: msg.meetingId }); return; }
+  S.call = {
+    meetingId: msg.meetingId, groupId: msg.groupId, state: 'ringing-in', muted: false, cameraOff: false, selfScreenSharing: false,
+    roster: [{ id: msg.from, name: msg.fromName, status: 'connected', screenSharing: false }],
+    inviteFrom: msg.fromName,
+  };
   renderCallOverlay();
 }
 
 const acceptCall = act(async () => {
-  const { peerId, offerSdp } = S.call;
-  localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-  pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-  wirePeerConnection(peerId);
-  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
-  await pc.setRemoteDescription(offerSdp);
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  sendSignal('call-answer', peerId, { sdp: answer });
-  S.call.state = 'active';
+  if (!S.call) return;
+  await acquireLocalMedia(true);
+  sendSignal('meeting-join', null, { meetingId: S.call.meetingId });
+});
+
+const joinMeeting = act(async (meetingId, groupId, participantCount) => {
+  if (S.call) return;
+  S.call = {
+    meetingId, groupId, state: 'ringing-out', muted: false, cameraOff: participantCount >= 2, selfScreenSharing: false,
+    roster: [{ id: S.me.id, name: 'You', status: 'connected', screenSharing: false }],
+  };
   renderCallOverlay();
+  await acquireLocalMedia(participantCount < 2);
+  sendSignal('meeting-join', null, { meetingId });
 });
 
 const declineCall = act(async () => {
-  if (S.call) sendSignal('call-decline', S.call.peerId, {});
+  if (S.call) sendSignal('meeting-decline', null, { meetingId: S.call.meetingId });
   teardownCall();
 });
 
 function endCall() {
-  if (S.call) sendSignal('call-hangup', S.call.peerId, {});
+  if (S.call) sendSignal('meeting-leave', null, { meetingId: S.call.meetingId });
   teardownCall();
 }
 
 function teardownCall() {
-  if (pc) { pc.close(); pc = null; }
+  for (const { pc } of peers.values()) pc.close();
+  peers.clear();
   if (localStream) { localStream.getTracks().forEach((t) => t.stop()); localStream = null; }
-  remoteStream = null;
-  clearInterval(callTimer); callTimer = null;
+  if (screenStream) { screenStream.getTracks().forEach((t) => t.stop()); screenStream = null; }
   S.call = null;
   renderCallOverlay();
 }
 
 function handleSignal(msg) {
-  if (msg.type === 'call-offer') { incomingCall(msg); return; }
-  if (!S.call || msg.from !== S.call.peerId) return;
-  if (msg.type === 'call-answer') { pc.setRemoteDescription(msg.sdp); S.call.state = 'active'; renderCallOverlay(); }
-  else if (msg.type === 'call-ice-candidate') pc && pc.addIceCandidate(msg.candidate).catch(() => {});
-  else if (msg.type === 'call-decline' || msg.type === 'call-busy' || msg.type === 'call-hangup') teardownCall();
+  if (msg.type === 'meeting-invite') { incomingMeetingInvite(msg); return; }
+  if (msg.type === 'meeting-join-ok') {
+    if (!S.call) return;
+    S.call.meetingId = msg.meetingId;
+    S.call.state = 'active';
+    applyRoster(msg);
+    return;
+  }
+  if (msg.type === 'meeting-roster') { applyRoster(msg); return; }
+  if (msg.type === 'meeting-full') { toast('That meeting already has 4 people.'); teardownCall(); return; }
+  if (!S.call || msg.meetingId !== S.call.meetingId) return;
+  if (msg.type === 'call-offer') {
+    const pc = ensurePeerConnection(msg.from);
+    pc.setRemoteDescription(msg.sdp)
+      .then(() => pc.createAnswer())
+      .then((answer) => pc.setLocalDescription(answer).then(() => answer))
+      .then((answer) => sendSignal('call-answer', msg.from, { sdp: answer, meetingId: S.call.meetingId }));
+  } else if (msg.type === 'call-answer') {
+    const p = peers.get(msg.from);
+    if (p) p.pc.setRemoteDescription(msg.sdp);
+  } else if (msg.type === 'call-ice-candidate') {
+    const p = peers.get(msg.from);
+    if (p) p.pc.addIceCandidate(msg.candidate).catch(() => {});
+  } else if (msg.type === 'meeting-screen-share') {
+    const r = S.call.roster.find((x) => x.id === msg.from);
+    if (r) { r.screenSharing = msg.sharing; renderCallOverlay(); }
+  }
 }
 
 function toggleMute() {
@@ -279,21 +362,82 @@ function toggleCamera() {
   renderCallOverlay();
 }
 
-let callOverlayEl;
+const canScreenShare = () => !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+
+const toggleScreenShare = act(async () => {
+  if (!S.call) return;
+  if (S.call.selfScreenSharing) { stopScreenShare(); return; }
+  if (!canScreenShare()) { toast('Screen sharing is not supported on this device.'); return; }
+  let stream;
+  try { stream = await navigator.mediaDevices.getDisplayMedia({ video: true }); } catch (e) { return; }
+  screenStream = stream;
+  const screenTrack = screenStream.getVideoTracks()[0];
+  screenTrack.onended = () => stopScreenShare();
+  for (const { pc } of peers.values()) {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    if (sender) sender.replaceTrack(screenTrack);
+  }
+  S.call.selfScreenSharing = true;
+  sendSignal('meeting-screen-share', null, { meetingId: S.call.meetingId, sharing: true });
+  renderCallOverlay();
+});
+
+function stopScreenShare() {
+  if (!S.call || !S.call.selfScreenSharing) return;
+  const camTrack = localStream && localStream.getVideoTracks()[0];
+  for (const { pc } of peers.values()) {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    if (sender && camTrack) sender.replaceTrack(camTrack);
+  }
+  if (screenStream) { screenStream.getTracks().forEach((t) => t.stop()); screenStream = null; }
+  S.call.selfScreenSharing = false;
+  sendSignal('meeting-screen-share', null, { meetingId: S.call.meetingId, sharing: false });
+  renderCallOverlay();
+}
+
+let callOverlayEl, callGridEl;
+const tileEls = new Map(); // peerId -> tile wrapper element, reused across renders
+
+function buildTile() {
+  return h('div', { class: 'call-tile' },
+    h('video', { class: 'call-video', autoplay: true, playsinline: true }),
+    h('div', { class: 'call-tile-name' }, ''),
+    h('div', { class: 'call-tile-badge' }, ''));
+}
+
+function updateTile(tile, r) {
+  const video = tile.querySelector('video');
+  const stream = r.id === S.me.id ? (S.call.selfScreenSharing ? screenStream : localStream) : (peers.get(r.id) && peers.get(r.id).remoteStream);
+  if (video.srcObject !== (stream || null)) video.srcObject = stream || null;
+  video.muted = r.id === S.me.id;
+  tile.querySelector('.call-tile-name').textContent = r.id === S.me.id ? 'You' : r.name;
+  tile.classList.toggle('ringing', r.status === 'ringing');
+  tile.classList.toggle('sharing', !!r.screenSharing);
+  tile.querySelector('.call-tile-badge').textContent =
+    r.status === 'ringing' ? 'Ringing…' : r.screenSharing ? '🖥️ Sharing' : '';
+}
+
 function renderCallOverlay() {
   if (!callOverlayEl) return;
   if (!S.call) { callOverlayEl.className = 'call-overlay hidden'; return; }
   callOverlayEl.className = 'call-overlay';
-  const remoteVideo = callOverlayEl.querySelector('.call-video.remote');
-  const localVideo = callOverlayEl.querySelector('.call-video.local');
-  if (remoteVideo.srcObject !== (remoteStream || null)) remoteVideo.srcObject = remoteStream || null;
-  if (localVideo.srcObject !== (localStream || null)) localVideo.srcObject = localStream || null;
+  callGridEl.className = `call-grid count-${S.call.roster.length}`;
 
+  const wanted = new Set(S.call.roster.map((r) => r.id));
+  for (const id of [...tileEls.keys()]) if (!wanted.has(id)) { tileEls.get(id).remove(); tileEls.delete(id); }
+  for (const r of S.call.roster) {
+    let tile = tileEls.get(r.id);
+    if (!tile) { tile = buildTile(); tileEls.set(r.id, tile); callGridEl.appendChild(tile); }
+    updateTile(tile, r);
+  }
+
+  const others = S.call.roster.filter((r) => r.id !== S.me.id);
   const label = callOverlayEl.querySelector('.call-label');
-  label.textContent = S.call.peerName + (
-    S.call.state === 'ringing-out' ? ' · Ringing…'
-      : S.call.state === 'ringing-in' ? ' · Incoming call'
-        : ' · Connected');
+  label.textContent = S.call.state === 'ringing-in'
+    ? `${S.call.inviteFrom || 'Someone'} is calling…`
+    : S.call.state === 'ringing-out'
+      ? (others.length ? `Calling ${others.map((r) => r.name).join(', ')}…` : 'Starting meeting…')
+      : `Connected · ${S.call.roster.length} in the call`;
 
   const incoming = callOverlayEl.querySelector('.call-incoming');
   incoming.style.display = S.call.state === 'ringing-in' ? 'flex' : 'none';
@@ -306,12 +450,15 @@ function renderCallOverlay() {
   const camBtn = callOverlayEl.querySelector('.call-cam');
   camBtn.textContent = S.call.cameraOff ? '📵' : '📷';
   camBtn.classList.toggle('on', S.call.cameraOff);
+  const screenBtn = callOverlayEl.querySelector('.call-screen');
+  screenBtn.style.display = canScreenShare() ? '' : 'none';
+  screenBtn.classList.toggle('on', S.call.selfScreenSharing);
 }
 
 function buildCallOverlay() {
+  callGridEl = h('div', { class: 'call-grid' });
   callOverlayEl = h('div', { class: 'call-overlay hidden' },
-    h('video', { class: 'call-video remote', autoplay: true, playsinline: true }),
-    h('video', { class: 'call-video local', autoplay: true, playsinline: true, muted: true }),
+    callGridEl,
     h('div', { class: 'call-label' }, ''),
     h('div', { class: 'call-incoming' },
       h('button', { class: 'btn call-decline', onclick: declineCall }, 'Decline'),
@@ -319,6 +466,7 @@ function buildCallOverlay() {
     h('div', { class: 'call-controls' },
       h('button', { class: 'icon call-mute', onclick: toggleMute }, '🎙️'),
       h('button', { class: 'icon call-cam', onclick: toggleCamera }, '📷'),
+      h('button', { class: 'icon call-screen', onclick: toggleScreenShare }, '🖥️'),
       h('button', { class: 'icon call-hangup', onclick: endCall }, '📞')));
   document.body.appendChild(callOverlayEl);
 }
@@ -550,6 +698,30 @@ function summaryTab(g) {
     done.map((t) => taskCard(t))));
 }
 
+function openMeetingPicker(g) {
+  const others = g.members.filter((m) => m.id !== S.me.id);
+  if (others.length <= MAX_PARTICIPANTS - 1) { startMeeting(g.group.id, others.map((m) => m.id)); return; }
+  S.pickingMeeting = new Set();
+  render();
+}
+
+function meetingPicker(g) {
+  const others = g.members.filter((m) => m.id !== S.me.id);
+  const cap = MAX_PARTICIPANTS - 1;
+  const picked = S.pickingMeeting;
+  return h('div', { class: 'pad', style: 'background: var(--card); border-bottom: 1px solid var(--line)' },
+    h('div', { class: 'sub' }, `Choose up to ${cap} people (${picked.size} of ${cap} selected)`),
+    h('div', { class: 'member-list' }, others.map((m) => h('label', { class: 'row', style: 'padding:8px 0' },
+      h('input', {
+        type: 'checkbox', checked: picked.has(m.id), disabled: !picked.has(m.id) && picked.size >= cap,
+        onchange: (e) => { if (e.target.checked) picked.add(m.id); else picked.delete(m.id); render(); },
+      }),
+      h('span', { style: 'flex:1;margin-left:8px' }, m.name)))),
+    h('div', { class: 'actions' },
+      h('button', { class: 'btn ghost small', onclick: () => { S.pickingMeeting = false; render(); } }, 'Cancel'),
+      h('button', { class: 'btn small', onclick: () => { const ids = [...picked]; S.pickingMeeting = false; startMeeting(g.group.id, ids); } }, 'Start meeting')));
+}
+
 function viewGroup() {
   const g = S.group;
   const back = h('button', { class: 'icon', 'aria-label': 'Back to chats', onclick: () => go({ name: 'chats' }) }, '‹');
@@ -568,13 +740,18 @@ function viewGroup() {
       h('div', { style: 'flex:1;min-width:0' },
         h('h1', {}, g.group.name),
         h('div', { class: 'sub' }, plural(g.members.length, 'member'))),
+      h('button', { class: 'icon', 'aria-label': 'Start a meeting', onclick: () => openMeetingPicker(g) }, '🎥'),
       h('button', { class: 'btn ghost small', 'aria-expanded': String(S.showMembers),
         onclick: () => { S.showMembers = !S.showMembers; render(); } }, 'People')),
+    g.activeMeeting && !S.call && h('button', { class: 'banner', onclick: () => joinMeeting(g.activeMeeting.meetingId, g.group.id, g.activeMeeting.participantCount) },
+      h('span', { class: 'cap' }, 'Meeting in progress'),
+      h('strong', {}, `Tap to join · ${g.activeMeeting.participantCount} in the call`)),
+    S.pickingMeeting && meetingPicker(g),
     S.showMembers && h('div', { class: 'pad', style: 'background: var(--card); border-bottom: 1px solid var(--line)' },
       h('div', { class: 'member-list' }, g.members.map((m) => h('div', { class: 'row', style: 'padding:8px 0' },
         h('span', { style: 'flex:1' }, nameOf(m.id)),
         m.id !== S.me.id && h('button', {
-          class: 'icon', 'aria-label': `Call ${m.name}`, onclick: () => startCall(m.id, m.name),
+          class: 'icon', 'aria-label': `Call ${m.name}`, onclick: () => startMeeting(g.group.id, [m.id]),
         }, '📞')))),
       field('Add someone by phone number', 'm-phone', { type: 'tel', inputmode: 'tel' }),
       h('button', { class: 'btn ghost', onclick: addMember }, 'Add to group')),

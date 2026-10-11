@@ -80,8 +80,50 @@ function sendTo(userId, payload) {
   return true;
 }
 
-// 1:1 call signaling, relayed over the same socket, only between people who share a group.
-const CALL_TYPES = new Set(['call-offer', 'call-answer', 'call-ice-candidate', 'call-decline', 'call-hangup']);
+// ---------- group meetings (mesh calls, up to MAX_PARTICIPANTS) ----------
+// In-memory only: a meeting does not survive a server restart, which is fine
+// since calls are live and nothing about them needs to be durable.
+const MAX_PARTICIPANTS = 4;
+const meetings = new Map(); // meetingId -> { groupId, participants: Set<userId>, invited: Set<userId> }
+const meetingByGroup = new Map(); // groupId -> meetingId
+
+function meetingRosterPayload(meeting) {
+  const named = (id) => { const u = get('SELECT id, name FROM users WHERE id = ?', id); return u ? { id: u.id, name: u.name } : null; };
+  return {
+    participants: [...meeting.participants].map(named).filter(Boolean),
+    invited: [...meeting.invited].map(named).filter(Boolean),
+  };
+}
+
+function broadcastRoster(meetingId) {
+  const meeting = meetings.get(meetingId);
+  if (!meeting) return;
+  const payload = Object.assign({ type: 'meeting-roster', meetingId }, meetingRosterPayload(meeting));
+  for (const id of new Set([...meeting.participants, ...meeting.invited])) sendTo(id, payload);
+}
+
+function endMeetingIfEmpty(meetingId) {
+  const meeting = meetings.get(meetingId);
+  if (!meeting) return;
+  if (meeting.participants.size === 0) {
+    meetings.delete(meetingId);
+    if (meetingByGroup.get(meeting.groupId) === meetingId) meetingByGroup.delete(meeting.groupId);
+    notifyGroup(meeting.groupId);
+  }
+}
+
+function leaveMeeting(meetingId, userId) {
+  const meeting = meetings.get(meetingId);
+  if (!meeting) return;
+  const was = meeting.participants.has(userId) || meeting.invited.has(userId);
+  meeting.participants.delete(userId);
+  meeting.invited.delete(userId);
+  if (was) broadcastRoster(meetingId);
+  endMeetingIfEmpty(meetingId);
+}
+
+// 1:1/mesh call signaling, relayed per-pair, only between people currently in the same meeting.
+const CALL_TYPES = new Set(['call-offer', 'call-answer', 'call-ice-candidate']);
 
 function addMessage(groupId, userId, kind, text, refId) {
   insert('INSERT INTO messages (group_id, user_id, kind, text, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
@@ -198,6 +240,8 @@ app.get('/api/groups/:id', route((req) => {
   const notices = all('SELECT * FROM notices WHERE group_id = ? ORDER BY id DESC LIMIT 50', group.id);
   for (const n of notices) n.acks = all('SELECT user_id, at FROM acks WHERE notice_id = ?', n.id);
   const messages = all('SELECT * FROM messages WHERE group_id = ? ORDER BY id DESC LIMIT 200', group.id).reverse();
+  const activeMeetingId = meetingByGroup.get(group.id);
+  const activeMeeting = activeMeetingId ? meetings.get(activeMeetingId) : null;
   return {
     group: { id: group.id, name: group.name },
     members: all(`SELECT u.id, u.name FROM users u JOIN members m ON m.user_id = u.id
@@ -206,6 +250,7 @@ app.get('/api/groups/:id', route((req) => {
     tasks: all(`SELECT * FROM tasks WHERE group_id = ? AND (done_at IS NULL OR done_at > ?)
                 ORDER BY done_at IS NOT NULL, due IS NULL, due, id`, group.id, weekAgo),
     notices,
+    activeMeeting: activeMeeting ? { meetingId: activeMeetingId, participantCount: activeMeeting.participants.size } : null,
   };
 }));
 
@@ -326,21 +371,80 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-    if (!CALL_TYPES.has(msg.type)) return;
-    const to = Number(msg.to);
-    if (!to || to === user.id) return;
-    const shareGroup = get(`SELECT 1 AS ok FROM members m1 JOIN members m2 ON m1.group_id = m2.group_id
-                            WHERE m1.user_id = ? AND m2.user_id = ?`, user.id, to);
-    if (!shareGroup) return;
-    const out = { type: msg.type, from: user.id, fromName: user.name, to };
-    if (msg.sdp) out.sdp = msg.sdp;
-    if (msg.candidate) out.candidate = msg.candidate;
-    const delivered = sendTo(to, out);
-    if (!delivered && msg.type === 'call-offer') sendTo(user.id, { type: 'call-busy', from: to, to: user.id });
+
+    if (msg.type === 'meeting-start') {
+      const groupId = Number(msg.groupId);
+      if (!get('SELECT 1 AS ok FROM members WHERE group_id = ? AND user_id = ?', groupId, user.id)) return;
+      let meetingId = meetingByGroup.get(groupId);
+      let meeting = meetingId && meetings.get(meetingId);
+      if (!meeting) {
+        meetingId = crypto.randomBytes(8).toString('hex');
+        meeting = { groupId, participants: new Set(), invited: new Set() };
+        meetings.set(meetingId, meeting);
+        meetingByGroup.set(groupId, meetingId);
+      }
+      meeting.participants.add(user.id);
+      const invitees = Array.isArray(msg.inviteeIds) ? msg.inviteeIds.map(Number) : [];
+      for (const id of invitees) {
+        if (id !== user.id && !meeting.participants.has(id) && meeting.participants.size + meeting.invited.size < MAX_PARTICIPANTS) {
+          meeting.invited.add(id);
+        }
+      }
+      sendTo(user.id, Object.assign({ type: 'meeting-join-ok', meetingId, groupId }, meetingRosterPayload(meeting)));
+      broadcastRoster(meetingId);
+      for (const id of invitees) {
+        if (meeting.invited.has(id)) sendTo(id, { type: 'meeting-invite', meetingId, groupId, from: user.id, fromName: user.name });
+      }
+      notifyGroup(groupId);
+      return;
+    }
+
+    if (msg.type === 'meeting-join') {
+      const meeting = meetings.get(msg.meetingId);
+      if (!meeting) return;
+      if (!get('SELECT 1 AS ok FROM members WHERE group_id = ? AND user_id = ?', meeting.groupId, user.id)) return;
+      if (!meeting.participants.has(user.id) && meeting.participants.size >= MAX_PARTICIPANTS) {
+        sendTo(user.id, { type: 'meeting-full', meetingId: msg.meetingId });
+        return;
+      }
+      meeting.invited.delete(user.id);
+      meeting.participants.add(user.id);
+      sendTo(user.id, Object.assign({ type: 'meeting-join-ok', meetingId: msg.meetingId, groupId: meeting.groupId }, meetingRosterPayload(meeting)));
+      broadcastRoster(msg.meetingId);
+      notifyGroup(meeting.groupId);
+      return;
+    }
+
+    if (msg.type === 'meeting-leave' || msg.type === 'meeting-decline') {
+      leaveMeeting(msg.meetingId, user.id);
+      return;
+    }
+
+    if (msg.type === 'meeting-screen-share') {
+      const meeting = meetings.get(msg.meetingId);
+      if (!meeting || !meeting.participants.has(user.id)) return;
+      const payload = { type: 'meeting-screen-share', meetingId: msg.meetingId, from: user.id, sharing: !!msg.sharing };
+      for (const id of meeting.participants) if (id !== user.id) sendTo(id, payload);
+      return;
+    }
+
+    if (CALL_TYPES.has(msg.type)) {
+      const to = Number(msg.to);
+      if (!to || to === user.id) return;
+      const meeting = meetings.get(msg.meetingId);
+      if (!meeting || !meeting.participants.has(user.id) || !meeting.participants.has(to)) return;
+      const out = { type: msg.type, from: user.id, fromName: user.name, to, meetingId: msg.meetingId };
+      if (msg.sdp) out.sdp = msg.sdp;
+      if (msg.candidate) out.candidate = msg.candidate;
+      sendTo(to, out);
+    }
   });
   ws.on('close', () => {
     const set = sockets.get(user.id);
     if (set) { set.delete(ws); if (!set.size) sockets.delete(user.id); }
+    if (!set || !set.size) {
+      for (const meetingId of [...meetings.keys()]) leaveMeeting(meetingId, user.id);
+    }
   });
   ws.on('error', () => {});
 });
