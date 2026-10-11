@@ -1,0 +1,17 @@
+{
+  "name": "chat-with-tasks",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Messaging app with built-in tasks, notices and a daily summary. Two modes: simple chat and advanced.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}
