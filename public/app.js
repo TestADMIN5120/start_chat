@@ -457,6 +457,10 @@ function render() {
   if (msgs) msgs.scrollTop = atBottom ? msgs.scrollHeight : oldScroll;
 }
 
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+}
+
 // ---------- start ----------
 (async function start() {
   render();
