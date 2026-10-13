@@ -9,6 +9,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const { DatabaseSync } = require('node:sqlite');
+const otp = require('./otp');
 
 const PORT = Number(process.env.PORT) || 3000;
 const DB_PATH = process.env.DB_FILE || path.join(__dirname, 'data.db');
@@ -140,7 +141,7 @@ app.use(express.json({ limit: '100kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const route = (fn) => (req, res, next) => {
-  try { res.json(fn(req) || { ok: true }); } catch (err) { next(err); }
+  Promise.resolve().then(() => fn(req)).then((data) => res.json(data || { ok: true })).catch(next);
 };
 
 function auth(req, res, next) {
@@ -159,12 +160,7 @@ function memberGroup(req) {
   return group;
 }
 
-// Sign in. NOTE: there is no SMS code check yet, so anyone who knows a phone
-// number can sign in as that person. Add OTP verification before public use.
-app.post('/api/login', route((req) => {
-  const name = cleanText(req.body.name, 40);
-  const phone = cleanPhone(req.body.phone);
-  if (phone.length < 8 || phone.length > 15) fail(400, 'Enter a valid phone number.');
+function signIn(phone, name) {
   let user = get('SELECT * FROM users WHERE phone = ?', phone);
   if (!user) {
     if (!name) fail(400, 'Enter your name.');
@@ -176,6 +172,28 @@ app.post('/api/login', route((req) => {
     user.name = name;
   }
   return { token: user.token, user: publicUser(user) };
+}
+
+// Start sign-in: request an OTP for a phone number (or, if MSG91 is not
+// configured, sign in immediately — see otp.js for details).
+app.post('/api/login/start', route(async (req) => {
+  const name = cleanText(req.body.name, 40);
+  const phone = cleanPhone(req.body.phone);
+  if (phone.length < 8 || phone.length > 15) fail(400, 'Enter a valid phone number.');
+  if (!otp.enabled) return signIn(phone, name);
+  if (!name && !get('SELECT 1 AS ok FROM users WHERE phone = ?', phone)) fail(400, 'Enter your name.');
+  await otp.send(phone, name);
+  return { otpRequired: true };
+}));
+
+// Finish sign-in: check the code the person received by SMS.
+app.post('/api/login/verify', route(async (req) => {
+  const phone = cleanPhone(req.body.phone);
+  const code = cleanText(req.body.otp, 10);
+  if (phone.length < 8 || phone.length > 15) fail(400, 'Enter a valid phone number.');
+  if (!code) fail(400, 'Enter the code you received.');
+  const name = await otp.verify(phone, code);
+  return signIn(phone, name);
 }));
 
 app.use('/api', auth);

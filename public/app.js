@@ -22,6 +22,7 @@ const S = {
   editingId: null,  // message currently being edited
   pickingMeeting: false, // showing the "choose who to invite" picker
   call: null,       // { meetingId, groupId, state: 'ringing-out'|'ringing-in'|'active', muted, cameraOff, selfScreenSharing, roster: [{id,name,status}], inviteFrom }
+  login: { stage: 'enter', phone: '' }, // stage: 'enter' (phone+name) or 'code' (enter OTP)
 };
 
 // ---------- small helpers ----------
@@ -121,12 +122,31 @@ function signOut() {
 }
 
 // ---------- actions ----------
-const signIn = act(async () => {
-  const data = await api('POST', '/api/login', { name: val('name'), phone: val('phone') });
+const requestCode = act(async () => {
+  const phone = val('phone');
+  const name = val('name');
+  const data = await api('POST', '/api/login/start', { name, phone });
+  if (data.otpRequired) {
+    S.login = { stage: 'code', phone };
+    render();
+  } else {
+    await finishSignIn(data);
+  }
+});
+
+const confirmCode = act(async () => {
+  const data = await api('POST', '/api/login/verify', { phone: S.login.phone, otp: val('code') });
+  await finishSignIn(data);
+});
+
+const backToPhone = () => { S.login = { stage: 'enter', phone: '' }; render(); };
+
+async function finishSignIn(data) {
   S.token = data.token; S.me = data.user; store.set('token', data.token);
+  S.login = { stage: 'enter', phone: '' };
   connect();
   await go({ name: 'chats' });
-});
+}
 
 const setMode = act(async (mode) => {
   S.me.mode = (await api('POST', '/api/mode', { mode })).mode;
@@ -548,13 +568,23 @@ function bottomNav(current) {
 
 // ---------- screens ----------
 function viewLogin() {
+  if (S.login.stage === 'code') {
+    return h('div', { class: 'screen' },
+      h('div', { class: 'pad', style: 'margin-top: 48px' },
+        h('h1', { style: 'font-family: Sora, sans-serif; font-size: 30px' }, 'Enter the code'),
+        h('p', { class: 'sub', style: 'font-size: 16px' }, `We sent a code by SMS to ${S.login.phone}.`),
+        field('Code', 'code', { type: 'text', inputmode: 'numeric', autocomplete: 'one-time-code',
+          onkeydown: (e) => { if (e.key === 'Enter') confirmCode(); } }),
+        h('button', { class: 'btn wide', onclick: confirmCode }, 'Verify'),
+        h('button', { class: 'link', onclick: backToPhone }, 'Use a different number')));
+  }
   return h('div', { class: 'screen' },
     h('div', { class: 'pad', style: 'margin-top: 48px' },
       h('h1', { style: 'font-family: Sora, sans-serif; font-size: 30px' }, 'Welcome'),
       h('p', { class: 'sub', style: 'font-size: 16px' }, 'Chat with your groups and keep track of who is doing what.'),
       field('Your name', 'name', { type: 'text', autocomplete: 'name' }),
       field('Phone number', 'phone', { type: 'tel', autocomplete: 'tel', inputmode: 'tel' }),
-      h('button', { class: 'btn wide', onclick: signIn }, 'Continue')));
+      h('button', { class: 'btn wide', onclick: requestCode }, 'Continue')));
 }
 
 function viewChats() {
