@@ -11,14 +11,17 @@ const { WebSocketServer } = require('ws');
 const { DatabaseSync } = require('node:sqlite');
 
 const PORT = Number(process.env.PORT) || 3000;
-const db = new DatabaseSync(process.env.DB_FILE || path.join(__dirname, 'data.db'));
+const DB_PATH = process.env.DB_FILE || path.join(__dirname, 'data.db');
+console.log(`Using database: ${DB_PATH}`);
+const db = new DatabaseSync(DB_PATH);
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL UNIQUE,
   mode TEXT NOT NULL DEFAULT 'chat', token TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS chat_groups (
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL);
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_by INTEGER NOT NULL, created_at INTEGER NOT NULL,
+  is_direct INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS members (
   group_id INTEGER NOT NULL, user_id INTEGER NOT NULL, PRIMARY KEY (group_id, user_id));
 CREATE TABLE IF NOT EXISTS messages (
@@ -50,6 +53,7 @@ function ensureColumn(table, column, ddl) {
 }
 ensureColumn('messages', 'edited_at', 'edited_at INTEGER');
 ensureColumn('messages', 'deleted_at', 'deleted_at INTEGER');
+ensureColumn('chat_groups', 'is_direct', 'is_direct INTEGER NOT NULL DEFAULT 0');
 
 const cleanPhone = (v) => String(v || '').replace(/\D/g, '');
 const cleanText = (v, max) => String(v || '').trim().slice(0, max);
@@ -184,15 +188,22 @@ app.post('/api/mode', route((req) => {
   return { mode };
 }));
 
+function directChatName(groupId, selfId) {
+  const other = get(`SELECT u.name FROM users u JOIN members m ON m.user_id = u.id
+                     WHERE m.group_id = ? AND m.user_id != ?`, groupId, selfId);
+  return other ? other.name : null;
+}
+
 app.get('/api/groups', route((req) => {
   const groups = all(`
-    SELECT g.id, g.name,
+    SELECT g.id, g.name, g.is_direct AS isDirect,
       (SELECT COUNT(*) FROM members WHERE group_id = g.id) AS memberCount,
       (SELECT COUNT(*) FROM tasks WHERE group_id = g.id AND done_at IS NULL) AS openAll,
       (SELECT COUNT(*) FROM tasks WHERE group_id = g.id AND done_at IS NULL AND assignee_id = ?) AS openMine
     FROM chat_groups g JOIN members m ON m.group_id = g.id
     WHERE m.user_id = ?`, req.user.id, req.user.id);
   for (const g of groups) {
+    if (g.isDirect) g.name = directChatName(g.id, req.user.id) || g.name;
     const last = get(`SELECT m.text, m.kind, m.created_at, m.deleted_at, u.name FROM messages m
                       LEFT JOIN users u ON u.id = m.user_id
                       WHERE m.group_id = ? ORDER BY m.id DESC LIMIT 1`, g.id);
@@ -227,6 +238,28 @@ app.post('/api/groups', route((req) => {
   return { id, notFound };
 }));
 
+// Add a contact: find-or-create a 1:1 direct chat with that phone number.
+app.post('/api/contacts', route((req) => {
+  const phone = cleanPhone(req.body.phone);
+  if (phone.length < 8 || phone.length > 15) fail(400, 'Enter a valid phone number.');
+  const other = get('SELECT * FROM users WHERE phone = ?', phone);
+  if (!other) fail(404, 'That number has not joined the app yet.');
+  if (other.id === req.user.id) fail(400, "That's your own number.");
+
+  const existing = get(`
+    SELECT g.id FROM chat_groups g
+    JOIN members m1 ON m1.group_id = g.id AND m1.user_id = ?
+    JOIN members m2 ON m2.group_id = g.id AND m2.user_id = ?
+    WHERE g.is_direct = 1`, req.user.id, other.id);
+  if (existing) return { id: existing.id };
+
+  const id = insert('INSERT INTO chat_groups (name, created_by, created_at, is_direct) VALUES (?, ?, ?, 1)',
+    other.name, req.user.id, Date.now());
+  run('INSERT INTO members (group_id, user_id) VALUES (?, ?)', id, req.user.id);
+  run('INSERT INTO members (group_id, user_id) VALUES (?, ?)', id, other.id);
+  return { id };
+}));
+
 app.post('/api/groups/:id/members', route((req) => {
   const group = memberGroup(req);
   const notFound = addMembersByPhone(group.id, [req.body.phone]);
@@ -242,8 +275,9 @@ app.get('/api/groups/:id', route((req) => {
   const messages = all('SELECT * FROM messages WHERE group_id = ? ORDER BY id DESC LIMIT 200', group.id).reverse();
   const activeMeetingId = meetingByGroup.get(group.id);
   const activeMeeting = activeMeetingId ? meetings.get(activeMeetingId) : null;
+  const name = group.is_direct ? (directChatName(group.id, req.user.id) || group.name) : group.name;
   return {
-    group: { id: group.id, name: group.name },
+    group: { id: group.id, name, isDirect: !!group.is_direct },
     members: all(`SELECT u.id, u.name FROM users u JOIN members m ON m.user_id = u.id
                   WHERE m.group_id = ? ORDER BY u.name`, group.id),
     messages,

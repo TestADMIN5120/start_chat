@@ -140,6 +140,11 @@ const createGroup = act(async () => {
   if (data.notFound.length) toast(`Not on the app yet: ${data.notFound.join(', ')}. Add them once they join.`);
 });
 
+const addContact = act(async () => {
+  const data = await api('POST', '/api/contacts', { phone: val('c-phone') });
+  await go({ name: 'group', id: data.id });
+});
+
 const addMember = act(async () => {
   await api('POST', `/api/groups/${S.view.id}/members`, { phone: val('m-phone') });
   clear('m-phone');
@@ -570,7 +575,9 @@ function viewChats() {
   return h('div', { class: 'screen' },
     h('header', { class: 'top' },
       h('h1', {}, 'Chats'),
-      h('button', { class: 'btn dark small', onclick: () => go({ name: 'newgroup' }) }, '+ New group')),
+      h('div', { style: 'display:flex;gap:8px' },
+        h('button', { class: 'btn ghost small', onclick: () => go({ name: 'newcontact' }) }, '+ Add contact'),
+        h('button', { class: 'btn dark small', onclick: () => go({ name: 'newgroup' }) }, '+ New group'))),
     h('div', { class: 'seg' }, modeBtn('chat', 'Chat mode'), modeBtn('advanced', 'Advanced mode')),
     adv && h('button', { class: 'banner', onclick: () => go({ name: 'today' }) },
       h('span', { class: 'cap' }, 'Today'),
@@ -590,6 +597,16 @@ function viewNewGroup() {
       field('Group name', 'g-name', { type: 'text', placeholder: 'For example: Shop team' }),
       field('Phone numbers to add', 'g-phones', { placeholder: 'One number per line. They must have signed in to the app once.' }, 'textarea'),
       h('button', { class: 'btn wide', onclick: createGroup }, 'Create group'))));
+}
+
+function viewNewContact() {
+  return h('div', { class: 'screen' },
+    h('header', { class: 'top bar' },
+      h('button', { class: 'icon', 'aria-label': 'Back to chats', onclick: () => go({ name: 'chats' }) }, '‹'),
+      h('h1', {}, 'Add contact')),
+    h('div', { class: 'scroll' }, h('div', { class: 'pad' },
+      field('Phone number', 'c-phone', { type: 'tel', autocomplete: 'tel', inputmode: 'tel', placeholder: 'They must have signed in to the app once.' }),
+      h('button', { class: 'btn wide', onclick: addContact }, 'Add contact'))));
 }
 
 function chatTab(g, adv) {
@@ -733,21 +750,22 @@ function viewGroup() {
     onclick: () => { S.view.tab = name; S.sel = null; render(); if (name === 'chat') scrollChat(true); },
   }, label);
   const openCount = g.tasks.filter((t) => !t.done_at).length;
+  const direct = g.group.isDirect;
   return h('div', { class: 'screen' },
     h('header', { class: 'top bar' },
       back,
       h('div', { class: 'avatar', style: 'width:40px;height:40px;border-radius:13px' }, initials(g.group.name)),
       h('div', { style: 'flex:1;min-width:0' },
         h('h1', {}, g.group.name),
-        h('div', { class: 'sub' }, plural(g.members.length, 'member'))),
+        !direct && h('div', { class: 'sub' }, plural(g.members.length, 'member'))),
       h('button', { class: 'icon', 'aria-label': 'Start a meeting', onclick: () => openMeetingPicker(g) }, '🎥'),
-      h('button', { class: 'btn ghost small', 'aria-expanded': String(S.showMembers),
+      !direct && h('button', { class: 'btn ghost small', 'aria-expanded': String(S.showMembers),
         onclick: () => { S.showMembers = !S.showMembers; render(); } }, 'People')),
     g.activeMeeting && !S.call && h('button', { class: 'banner', onclick: () => joinMeeting(g.activeMeeting.meetingId, g.group.id, g.activeMeeting.participantCount) },
       h('span', { class: 'cap' }, 'Meeting in progress'),
       h('strong', {}, `Tap to join · ${g.activeMeeting.participantCount} in the call`)),
     S.pickingMeeting && meetingPicker(g),
-    S.showMembers && h('div', { class: 'pad', style: 'background: var(--card); border-bottom: 1px solid var(--line)' },
+    !direct && S.showMembers && h('div', { class: 'pad', style: 'background: var(--card); border-bottom: 1px solid var(--line)' },
       h('div', { class: 'member-list' }, g.members.map((m) => h('div', { class: 'row', style: 'padding:8px 0' },
         h('span', { style: 'flex:1' }, nameOf(m.id)),
         m.id !== S.me.id && h('button', {
@@ -804,6 +822,7 @@ function render() {
   if (!S.me) screen = viewLogin();
   else if (S.view.name === 'group') screen = viewGroup();
   else if (S.view.name === 'newgroup') screen = viewNewGroup();
+  else if (S.view.name === 'newcontact') screen = viewNewContact();
   else if (S.view.name === 'today' && S.me.mode === 'advanced') screen = viewToday();
   else screen = viewChats();
   root.replaceChildren(screen, S.toast ? h('div', { class: 'toast', role: 'status' }, S.toast) : '');
