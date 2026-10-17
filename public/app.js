@@ -18,7 +18,6 @@ const S = {
   sel: null,        // message picked to turn into a task
   showMembers: false,
   toast: '',
-  login: { stage: 'phone', busy: false, confirmation: null }, // OTP sign-in state
 };
 
 // ---------- small helpers ----------
@@ -113,49 +112,12 @@ function signOut() {
 }
 
 // ---------- actions ----------
-let recaptcha;
-function getRecaptcha() {
-  if (!recaptcha) {
-    recaptcha = new firebase.auth.RecaptchaVerifier('recaptcha-container', { size: 'invisible' });
-  }
-  return recaptcha;
-}
-
-// E.164 is what Firebase phone auth requires: a leading + and country code.
-function toE164(phone) {
-  const trimmed = phone.trim();
-  if (!trimmed.startsWith('+')) return null;
-  const digits = trimmed.slice(1).replace(/\D/g, '');
-  return digits ? `+${digits}` : null;
-}
-
-const requestCode = act(async () => {
-  const phone = val('phone');
-  if (!phone) return;
-  const e164 = toE164(phone);
-  if (!e164) { toast('Include your country code, for example +91XXXXXXXXXX.'); return; }
-  S.login.busy = true; render();
-  try {
-    const confirmation = await firebase.auth().signInWithPhoneNumber(e164, getRecaptcha());
-    S.login = { stage: 'code', busy: false, confirmation, name: val('name'), phone };
-    render();
-    toast('Code sent. Check your phone.');
-  } finally {
-    S.login.busy = false;
-  }
-});
-
-const verifyCode = act(async () => {
-  const result = await S.login.confirmation.confirm(val('code'));
-  const idToken = await result.user.getIdToken();
-  const data = await api('POST', '/api/login', { idToken, name: S.login.name });
+const signIn = act(async () => {
+  const data = await api('POST', '/api/login', { name: val('name'), phone: val('phone') });
   S.token = data.token; S.me = data.user; store.set('token', data.token);
-  S.login = { stage: 'phone', busy: false, confirmation: null };
   connect();
   await go({ name: 'chats' });
 });
-
-const backToPhone = () => { S.login = { stage: 'phone', busy: false, confirmation: null }; render(); };
 
 const setMode = act(async (mode) => {
   S.me.mode = (await api('POST', '/api/mode', { mode })).mode;
@@ -275,18 +237,13 @@ function bottomNav(current) {
 
 // ---------- screens ----------
 function viewLogin() {
-  const atCode = S.login.stage === 'code';
   return h('div', { class: 'screen' },
     h('div', { class: 'pad', style: 'margin-top: 48px' },
       h('h1', { style: 'font-family: Sora, sans-serif; font-size: 30px' }, 'Welcome'),
-      h('p', { class: 'sub', style: 'font-size: 16px' },
-        atCode ? `Enter the code we sent to ${S.login.phone}.` : 'Chat with your groups and keep track of who is doing what.'),
-      !atCode && field('Your name', 'name', { type: 'text', autocomplete: 'name' }),
-      !atCode && field('Phone number', 'phone', { type: 'tel', autocomplete: 'tel', inputmode: 'tel', placeholder: '+91XXXXXXXXXX' }),
-      !atCode && h('button', { class: 'btn wide', onclick: requestCode, disabled: S.login.busy }, S.login.busy ? 'Sending…' : 'Send code'),
-      atCode && field('6-digit code', 'code', { type: 'tel', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: 6 }),
-      atCode && h('button', { class: 'btn wide', onclick: verifyCode }, 'Verify & continue'),
-      atCode && h('button', { class: 'link', onclick: backToPhone }, 'Use a different number')));
+      h('p', { class: 'sub', style: 'font-size: 16px' }, 'Chat with your groups and keep track of who is doing what.'),
+      field('Your name', 'name', { type: 'text', autocomplete: 'name' }),
+      field('Phone number', 'phone', { type: 'tel', autocomplete: 'tel', inputmode: 'tel' }),
+      h('button', { class: 'btn wide', onclick: signIn }, 'Continue')));
 }
 
 function viewChats() {

@@ -9,16 +9,9 @@ const crypto = require('crypto');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const { DatabaseSync } = require('node:sqlite');
-const { initializeApp, cert } = require('firebase-admin/app');
-const { getAuth } = require('firebase-admin/auth');
 
 const PORT = Number(process.env.PORT) || 3000;
 const db = new DatabaseSync(process.env.DB_FILE || path.join(__dirname, 'data.db'));
-
-const SERVICE_ACCOUNT_FILE = process.env.FIREBASE_SERVICE_ACCOUNT_FILE
-  || path.join(__dirname, 'chatapp-22c89-firebase-adminsdk-fbsvc-bb503e87da.json');
-initializeApp({ credential: cert(require(SERVICE_ACCOUNT_FILE)) });
-const firebaseAuth = getAuth();
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -82,7 +75,7 @@ app.use(express.json({ limit: '100kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const route = (fn) => (req, res, next) => {
-  Promise.resolve().then(() => fn(req)).then((data) => res.json(data || { ok: true })).catch(next);
+  try { res.json(fn(req) || { ok: true }); } catch (err) { next(err); }
 };
 
 function auth(req, res, next) {
@@ -101,21 +94,12 @@ function memberGroup(req) {
   return group;
 }
 
-// Sign in: the browser verifies the phone number with Firebase (which sends
-// the real SMS and checks the code), then hands us the resulting Firebase ID
-// token. We verify that token server-side and issue our own app token.
-app.post('/api/login', route(async (req) => {
+// Sign in. NOTE: there is no SMS code check yet, so anyone who knows a phone
+// number can sign in as that person. Add OTP verification before public use.
+app.post('/api/login', route((req) => {
   const name = cleanText(req.body.name, 40);
-  const idToken = String(req.body.idToken || '');
-  if (!idToken) fail(400, 'Missing sign-in token.');
-  let decoded;
-  try {
-    decoded = await firebaseAuth.verifyIdToken(idToken);
-  } catch (e) {
-    fail(401, 'That sign-in code is invalid or expired. Try again.');
-  }
-  const phone = cleanPhone(decoded.phone_number);
-  if (phone.length < 8 || phone.length > 15) fail(400, 'Could not read a valid phone number.');
+  const phone = cleanPhone(req.body.phone);
+  if (phone.length < 8 || phone.length > 15) fail(400, 'Enter a valid phone number.');
   let user = get('SELECT * FROM users WHERE phone = ?', phone);
   if (!user) {
     if (!name) fail(400, 'Enter your name.');
