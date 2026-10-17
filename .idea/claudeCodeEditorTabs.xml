@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ClaudeCodeEditorTabs">
+    <option name="activeSessionId" value="5865d84e-d300-4908-aab8-fb76c3928e57" />
+    <option name="openSessionIds">
+      <list>
+        <option value="40bc998b-8fae-4ce0-bf71-b3fb907e0fde" />
+        <option value="23b26386-2657-4c94-86c6-4c11e90098a7" />
+        <option value="5865d84e-d300-4908-aab8-fb76c3928e57" />
+      </list>
+    </option>
+    <option name="sessionPaths">
+      <map>
+        <entry key="23b26386-2657-4c94-86c6-4c11e90098a7" value="/sessions/c5fbd2bd-4d19-4183-b58e-37e92ce557fc" />
+        <entry key="40bc998b-8fae-4ce0-bf71-b3fb907e0fde" value="/sessions/new" />
+        <entry key="5865d84e-d300-4908-aab8-fb76c3928e57" value="/sessions/c5fbd2bd-4d19-4183-b58e-37e92ce557fc" />
+      </map>
+    </option>
+    <option name="sessionTitles">
+      <map>
+        <entry key="23b26386-2657-4c94-86c6-4c11e90098a7" value="can you make it working with OTP" />
+        <entry key="40bc998b-8fae-4ce0-bf71-b3fb907e0fde" value="Claude Code" />
+        <entry key="5865d84e-d300-4908-aab8-fb76c3928e57" value="can you make it working with OTP" />
+      </map>
+    </option>
+  </component>
+</project>
