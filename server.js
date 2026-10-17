@@ -9,6 +9,13 @@ const crypto = require('crypto');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const { DatabaseSync } = require('node:sqlite');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+
+initializeApp({
+  credential: cert(require('./chatapp-22c89-firebase-adminsdk-fbsvc-bb503e87da.json')),
+});
+const firebaseAuth = getAuth();
 
 const PORT = Number(process.env.PORT) || 3000;
 const db = new DatabaseSync(process.env.DB_FILE || path.join(__dirname, 'data.db'));
@@ -43,6 +50,14 @@ const get = (sql, ...p) => db.prepare(sql).get(...p);
 const run = (sql, ...p) => db.prepare(sql).run(...p);
 const insert = (sql, ...p) => Number(run(sql, ...p).lastInsertRowid);
 
+function ensureColumn(table, column, ddl) {
+  if (!all(`PRAGMA table_info(${table})`).some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  }
+}
+ensureColumn('messages', 'edited_at', 'edited_at INTEGER');
+ensureColumn('messages', 'deleted_at', 'deleted_at INTEGER');
+
 const cleanPhone = (v) => String(v || '').replace(/\D/g, '');
 const cleanText = (v, max) => String(v || '').trim().slice(0, max);
 const publicUser = (u) => ({ id: u.id, name: u.name, phone: u.phone, mode: u.mode });
@@ -64,6 +79,59 @@ function notifyGroup(groupId) {
   }
 }
 
+function sendTo(userId, payload) {
+  const set = sockets.get(userId);
+  if (!set || !set.size) return false;
+  const msg = JSON.stringify(payload);
+  for (const ws of set) if (ws.readyState === 1) ws.send(msg);
+  return true;
+}
+
+// ---------- group meetings (mesh calls, up to MAX_PARTICIPANTS) ----------
+// In-memory only: a meeting does not survive a server restart, which is fine
+// since calls are live and nothing about them needs to be durable.
+const MAX_PARTICIPANTS = 4;
+const meetings = new Map(); // meetingId -> { groupId, participants: Set<userId>, invited: Set<userId> }
+const meetingByGroup = new Map(); // groupId -> meetingId
+
+function meetingRosterPayload(meeting) {
+  const named = (id) => { const u = get('SELECT id, name FROM users WHERE id = ?', id); return u ? { id: u.id, name: u.name } : null; };
+  return {
+    participants: [...meeting.participants].map(named).filter(Boolean),
+    invited: [...meeting.invited].map(named).filter(Boolean),
+  };
+}
+
+function broadcastRoster(meetingId) {
+  const meeting = meetings.get(meetingId);
+  if (!meeting) return;
+  const payload = Object.assign({ type: 'meeting-roster', meetingId }, meetingRosterPayload(meeting));
+  for (const id of new Set([...meeting.participants, ...meeting.invited])) sendTo(id, payload);
+}
+
+function endMeetingIfEmpty(meetingId) {
+  const meeting = meetings.get(meetingId);
+  if (!meeting) return;
+  if (meeting.participants.size === 0) {
+    meetings.delete(meetingId);
+    if (meetingByGroup.get(meeting.groupId) === meetingId) meetingByGroup.delete(meeting.groupId);
+    notifyGroup(meeting.groupId);
+  }
+}
+
+function leaveMeeting(meetingId, userId) {
+  const meeting = meetings.get(meetingId);
+  if (!meeting) return;
+  const was = meeting.participants.has(userId) || meeting.invited.has(userId);
+  meeting.participants.delete(userId);
+  meeting.invited.delete(userId);
+  if (was) broadcastRoster(meetingId);
+  endMeetingIfEmpty(meetingId);
+}
+
+// 1:1/mesh call signaling, relayed per-pair, only between people currently in the same meeting.
+const CALL_TYPES = new Set(['call-offer', 'call-answer', 'call-ice-candidate']);
+
 function addMessage(groupId, userId, kind, text, refId) {
   insert('INSERT INTO messages (group_id, user_id, kind, text, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?)',
     groupId, userId, kind, text, refId || null, Date.now());
@@ -75,7 +143,7 @@ app.use(express.json({ limit: '100kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const route = (fn) => (req, res, next) => {
-  try { res.json(fn(req) || { ok: true }); } catch (err) { next(err); }
+  Promise.resolve().then(() => fn(req)).then((data) => res.json(data || { ok: true }), (err) => next(err));
 };
 
 function auth(req, res, next) {
@@ -94,12 +162,21 @@ function memberGroup(req) {
   return group;
 }
 
-// Sign in. NOTE: there is no SMS code check yet, so anyone who knows a phone
-// number can sign in as that person. Add OTP verification before public use.
-app.post('/api/login', route((req) => {
+// Sign in. The client verifies the phone number with Firebase (SMS code +
+// reCAPTCHA) and sends us the resulting ID token; we verify it server-side
+// with firebase-admin so we know the phone number is real before trusting it.
+app.post('/api/login', route(async (req) => {
+  const idToken = String(req.body.idToken || '');
+  if (!idToken) fail(400, 'Missing sign-in token.');
+  let decoded;
+  try {
+    decoded = await firebaseAuth.verifyIdToken(idToken);
+  } catch (e) {
+    fail(401, 'That sign-in token is not valid. Try again.');
+  }
+  const phone = cleanPhone(decoded.phone_number);
+  if (phone.length < 8 || phone.length > 15) fail(400, 'That account has no valid phone number.');
   const name = cleanText(req.body.name, 40);
-  const phone = cleanPhone(req.body.phone);
-  if (phone.length < 8 || phone.length > 15) fail(400, 'Enter a valid phone number.');
   let user = get('SELECT * FROM users WHERE phone = ?', phone);
   if (!user) {
     if (!name) fail(400, 'Enter your name.');
@@ -132,10 +209,10 @@ app.get('/api/groups', route((req) => {
     FROM chat_groups g JOIN members m ON m.group_id = g.id
     WHERE m.user_id = ?`, req.user.id, req.user.id);
   for (const g of groups) {
-    const last = get(`SELECT m.text, m.kind, m.created_at, u.name FROM messages m
+    const last = get(`SELECT m.text, m.kind, m.created_at, m.deleted_at, u.name FROM messages m
                       LEFT JOIN users u ON u.id = m.user_id
                       WHERE m.group_id = ? ORDER BY m.id DESC LIMIT 1`, g.id);
-    g.last = last || null;
+    g.last = last ? { ...last, text: last.deleted_at ? 'Message deleted' : last.text } : null;
   }
   groups.sort((a, b) => (b.last ? b.last.created_at : 0) - (a.last ? a.last.created_at : 0));
   return { groups };
@@ -179,6 +256,8 @@ app.get('/api/groups/:id', route((req) => {
   const notices = all('SELECT * FROM notices WHERE group_id = ? ORDER BY id DESC LIMIT 50', group.id);
   for (const n of notices) n.acks = all('SELECT user_id, at FROM acks WHERE notice_id = ?', n.id);
   const messages = all('SELECT * FROM messages WHERE group_id = ? ORDER BY id DESC LIMIT 200', group.id).reverse();
+  const activeMeetingId = meetingByGroup.get(group.id);
+  const activeMeeting = activeMeetingId ? meetings.get(activeMeetingId) : null;
   return {
     group: { id: group.id, name: group.name },
     members: all(`SELECT u.id, u.name FROM users u JOIN members m ON m.user_id = u.id
@@ -187,6 +266,7 @@ app.get('/api/groups/:id', route((req) => {
     tasks: all(`SELECT * FROM tasks WHERE group_id = ? AND (done_at IS NULL OR done_at > ?)
                 ORDER BY done_at IS NOT NULL, due IS NULL, due, id`, group.id, weekAgo),
     notices,
+    activeMeeting: activeMeeting ? { meetingId: activeMeetingId, participantCount: activeMeeting.participants.size } : null,
   };
 }));
 
@@ -196,6 +276,31 @@ app.post('/api/groups/:id/messages', route((req) => {
   if (!text) fail(400, 'Type a message first.');
   addMessage(group.id, req.user.id, 'text', text);
   notifyGroup(group.id);
+}));
+
+function ownedTextMessage(req) {
+  const id = Number(req.params.id);
+  const msg = get('SELECT * FROM messages WHERE id = ?', id);
+  if (!msg || msg.kind !== 'text' || msg.deleted_at) fail(404, 'Message not found.');
+  if (msg.user_id !== req.user.id) fail(403, 'You can only change your own messages.');
+  if (!get('SELECT 1 AS ok FROM members WHERE group_id = ? AND user_id = ?', msg.group_id, req.user.id)) {
+    fail(404, 'Message not found.');
+  }
+  return msg;
+}
+
+app.put('/api/messages/:id', route((req) => {
+  const msg = ownedTextMessage(req);
+  const text = cleanText(req.body.text, 4000);
+  if (!text) fail(400, 'Type a message first.');
+  run('UPDATE messages SET text = ?, edited_at = ? WHERE id = ?', text, Date.now(), msg.id);
+  notifyGroup(msg.group_id);
+}));
+
+app.delete('/api/messages/:id', route((req) => {
+  const msg = ownedTextMessage(req);
+  run('UPDATE messages SET deleted_at = ? WHERE id = ?', Date.now(), msg.id);
+  notifyGroup(msg.group_id);
 }));
 
 app.post('/api/groups/:id/tasks', route((req) => {
@@ -275,13 +380,87 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', (ws, req) => {
   const token = new URL(req.url, 'http://x').searchParams.get('token');
-  const user = token && get('SELECT id FROM users WHERE token = ?', token);
+  const user = token && get('SELECT id, name FROM users WHERE token = ?', token);
   if (!user) return ws.close();
   if (!sockets.has(user.id)) sockets.set(user.id, new Set());
   sockets.get(user.id).add(ws);
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+
+    if (msg.type === 'meeting-start') {
+      const groupId = Number(msg.groupId);
+      if (!get('SELECT 1 AS ok FROM members WHERE group_id = ? AND user_id = ?', groupId, user.id)) return;
+      let meetingId = meetingByGroup.get(groupId);
+      let meeting = meetingId && meetings.get(meetingId);
+      if (!meeting) {
+        meetingId = crypto.randomBytes(8).toString('hex');
+        meeting = { groupId, participants: new Set(), invited: new Set() };
+        meetings.set(meetingId, meeting);
+        meetingByGroup.set(groupId, meetingId);
+      }
+      meeting.participants.add(user.id);
+      const invitees = Array.isArray(msg.inviteeIds) ? msg.inviteeIds.map(Number) : [];
+      for (const id of invitees) {
+        if (id !== user.id && !meeting.participants.has(id) && meeting.participants.size + meeting.invited.size < MAX_PARTICIPANTS) {
+          meeting.invited.add(id);
+        }
+      }
+      sendTo(user.id, Object.assign({ type: 'meeting-join-ok', meetingId, groupId }, meetingRosterPayload(meeting)));
+      broadcastRoster(meetingId);
+      for (const id of invitees) {
+        if (meeting.invited.has(id)) sendTo(id, { type: 'meeting-invite', meetingId, groupId, from: user.id, fromName: user.name });
+      }
+      notifyGroup(groupId);
+      return;
+    }
+
+    if (msg.type === 'meeting-join') {
+      const meeting = meetings.get(msg.meetingId);
+      if (!meeting) return;
+      if (!get('SELECT 1 AS ok FROM members WHERE group_id = ? AND user_id = ?', meeting.groupId, user.id)) return;
+      if (!meeting.participants.has(user.id) && meeting.participants.size >= MAX_PARTICIPANTS) {
+        sendTo(user.id, { type: 'meeting-full', meetingId: msg.meetingId });
+        return;
+      }
+      meeting.invited.delete(user.id);
+      meeting.participants.add(user.id);
+      sendTo(user.id, Object.assign({ type: 'meeting-join-ok', meetingId: msg.meetingId, groupId: meeting.groupId }, meetingRosterPayload(meeting)));
+      broadcastRoster(msg.meetingId);
+      notifyGroup(meeting.groupId);
+      return;
+    }
+
+    if (msg.type === 'meeting-leave' || msg.type === 'meeting-decline') {
+      leaveMeeting(msg.meetingId, user.id);
+      return;
+    }
+
+    if (msg.type === 'meeting-screen-share') {
+      const meeting = meetings.get(msg.meetingId);
+      if (!meeting || !meeting.participants.has(user.id)) return;
+      const payload = { type: 'meeting-screen-share', meetingId: msg.meetingId, from: user.id, sharing: !!msg.sharing };
+      for (const id of meeting.participants) if (id !== user.id) sendTo(id, payload);
+      return;
+    }
+
+    if (CALL_TYPES.has(msg.type)) {
+      const to = Number(msg.to);
+      if (!to || to === user.id) return;
+      const meeting = meetings.get(msg.meetingId);
+      if (!meeting || !meeting.participants.has(user.id) || !meeting.participants.has(to)) return;
+      const out = { type: msg.type, from: user.id, fromName: user.name, to, meetingId: msg.meetingId };
+      if (msg.sdp) out.sdp = msg.sdp;
+      if (msg.candidate) out.candidate = msg.candidate;
+      sendTo(to, out);
+    }
+  });
   ws.on('close', () => {
     const set = sockets.get(user.id);
     if (set) { set.delete(ws); if (!set.size) sockets.delete(user.id); }
+    if (!set || !set.size) {
+      for (const meetingId of [...meetings.keys()]) leaveMeeting(meetingId, user.id);
+    }
   });
   ws.on('error', () => {});
 });
